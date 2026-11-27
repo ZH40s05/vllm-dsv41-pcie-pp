@@ -1,0 +1,152 @@
+diff --git a/tests/models/test_deepseek_v41_pipeline.py b/tests/models/test_deepseek_v41_pipeline.py
+index bab72e0..c841ac9 100644
+--- a/tests/models/test_deepseek_v41_pipeline.py
++++ b/tests/models/test_deepseek_v41_pipeline.py
+@@ -82,6 +82,29 @@ def test_pipeline_cut_validates_source_topology(pipeline_module, flash_sharing_c
+         )
+ 
+ 
++@pytest.mark.parametrize(
++    ("start", "end", "expected_error"),
++    [
++        (0, 40, None),
++        (14, 40, None),
++        (20, 40, "first layer of its pipeline stage"),
++        (0, 26, "hold every layer after it"),
++    ],
++)
++def test_decoder_replay_requires_local_predecessor_and_tail(
++    pipeline_module, flash_sharing_config, start, end, expected_error
++):
++    config = flash_sharing_config
++    cut = max(config.kv_source_layer_ids)
++    reason = pipeline_module.decoder_replay_partition_error(
++        start, end, config.num_hidden_layers, cut
++    )
++    if expected_error is None:
++        assert reason is None
++    else:
++        assert reason is not None and expected_error in reason
++
++
+ @pytest.mark.skip_global_cleanup
+ def test_stage_entry_injects_engram_before_mhc_pre(monkeypatch):
+     model_module = import_module("vllm.models.deepseek_v41.nvidia.model")
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index 238b5c8..cf16233 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -67,6 +67,7 @@ from vllm.model_executor.models.utils import (
+     is_pp_missing_parameter,
+     make_layers,
+     maybe_prefix,
++    spec_decode_needs_target_embed,
+ )
+ from vllm.models.common.ops.sequence_parallel import (
+     sp_all_gather,
+@@ -130,7 +131,12 @@ from .ops.mhc import (
+     supports_mhc_overlap,
+     use_ampere_mhc,
+ )
+-from .pipeline import PipelineBoundary, PipelineRelay, get_pipeline_boundaries
++from .pipeline import (
++    PipelineBoundary,
++    PipelineRelay,
++    decoder_replay_partition_error,
++    get_pipeline_boundaries,
++)
+ from .quantization import DeferringMarlinExperts
+ from .specialized_decode import records_decode_metadata, specialized_decode_config
+ from .specialized_decode.ampere import is_ampere
+@@ -813,6 +819,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+ 
+ 
+ class DeepseekV4Model(nn.Module, EagleModelMixin):
++    supports_aux_hidden_states_over_pp = True
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -958,7 +966,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         else:
+             self.candidate_block_buffer = None
+ 
+-        if get_pp_group().is_first_rank:
++        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
+             # On SM80 embed_input_ids sums the vocabulary shards with the
+             # two-shot kernel too (and so does the DSpark draft model, which
+             # shares this module).
+@@ -1378,6 +1386,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 {
+                     "hidden_states": hidden_states,
+                     "pre_mix": pre_mix,
++                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                     **(
+                         self.pipeline_relay.transfer(
+                             positions,
+@@ -1458,7 +1467,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     residual,
+                     engram_hashes,
+                     engram_mask,
+-                    capture_previous_aux=idx in self.aux_hidden_state_layers,
++                    capture_previous_aux=(
++                        idx >= self._aux_first_local_layer
++                        and idx in self.aux_hidden_state_layers
++                    ),
+                     mega_gate_metadata=mega_gate_metadata,
+                 )
+             )
+@@ -1578,6 +1590,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+ 
+     def _decoder_replay_supported(self, vllm_config: VllmConfig, cut: int) -> bool:
+         """Whether this rank may replay from layer `cut` on; warns when not."""
++        partition_error = decoder_replay_partition_error(
++            self.start_layer, self.end_layer, self.config.num_hidden_layers, cut
++        )
++        if partition_error is not None:
++            logger.warning_once(
++                "Decoder SWA bounded replay is off: %s.", partition_error
++            )
++            return False
+         parallel_config = vllm_config.parallel_config
+         spec_config = vllm_config.speculative_config
+         draft_config = spec_config.draft_model_config if spec_config else None
+@@ -1585,12 +1605,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         draft_window = getattr(draft_hf_config, "sliding_window", None)
+         draft_layer_types = getattr(draft_hf_config, "layer_types", None) or ()
+         window = self.config.sliding_window
+-        if self.start_layer > cut or self.end_layer < self.config.num_hidden_layers:
+-            reason = (
+-                "the pipeline stage holding the last KV source layer must also "
+-                "hold every layer after it"
+-            )
+-        elif self.use_sequence_parallel or parallel_config.use_ubatching:
++        if self.use_sequence_parallel or parallel_config.use_ubatching:
+             reason = (
+                 "the replay-layer batch shrinks per rank, which sequence and "
+                 "microbatching cannot follow"
+diff --git a/vllm/models/deepseek_v41/nvidia/pipeline.py b/vllm/models/deepseek_v41/nvidia/pipeline.py
+index 34077f6..b2a0b9a 100644
+--- a/vllm/models/deepseek_v41/nvidia/pipeline.py
++++ b/vllm/models/deepseek_v41/nvidia/pipeline.py
+@@ -122,6 +122,20 @@ def get_pipeline_boundaries(
+     return tuple(boundaries)
+ 
+ 
++def decoder_replay_partition_error(
++    start_layer: int, end_layer: int, num_layers: int, cut: int
++) -> str | None:
++    """Replay requires a local mHC predecessor and every layer from cut onward."""
++    if start_layer > cut or end_layer < num_layers:
++        return (
++            "the pipeline stage holding the last KV source layer must also "
++            "hold every layer after it"
++        )
++    if start_layer == cut:
++        return "the last KV source is the first layer of its pipeline stage"
++    return None
++
++
+ class PipelineCache(nn.Module, AttentionLayerBase):
+     """A source-named replica participates in the same scheduler cache group."""
+ 
