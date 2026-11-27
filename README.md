@@ -19,10 +19,10 @@ git apply --check "$PATCH_KIT/patches/vllm-b935849ce-dsv41-tp4pp2.patch"
 git apply "$PATCH_KIT/patches/vllm-b935849ce-dsv41-tp4pp2.patch"
 ```
 
-Run the modified Python package with a matching native build in an isolated environment; confirm both the launcher and worker imports see the patched modules. Do not overwrite an existing production installation. The included regression cases are in `tests/models/test_deepseek_v41_pipeline.py` in the patched checkout. With the vLLM test environment installed, run:
+Run the modified Python package with a matching native build in an isolated environment; confirm both the launcher and worker imports see the patched modules. Do not overwrite an existing production installation. The included regression cases are in `tests/models/test_deepseek_v41_pipeline.py` in the patched checkout. Activate your matching vLLM test environment, then run from the patched checkout:
 
 ```sh
-.venv/bin/python -m pytest -q tests/models/test_deepseek_v41_pipeline.py
+python -m pytest -q tests/models/test_deepseek_v41_pipeline.py
 ```
 
 For this snapshot, apply and reverse-apply checks ran against files freshly exported from the pinned commit. The three patched Python files compiled, and the four partition-boundary cases passed in an isolated source-function check. The full CUDA pytest suite was not rerun for this packaging step.
